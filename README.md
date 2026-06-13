@@ -1,345 +1,392 @@
-# RAG-vault
-Retrieval-Augmented Generation (RAG) for school books, documents and general school usage.
+# VaultRAG
 
+Sistema RAG (Retrieval-Augmented Generation) ibrido — vettoriale + knowledge graph — per un vault Obsidian, pensato per studio e uso scolastico generale (appunti, libri, dispense).
 
+Backend Flask in Python (`app.py`, `rag_core.py`), frontend single-page HTML/JS servito inline da Flask (`frontend.html`).
 
-documentazione VaultRAG
-Manuale Tecnico
-app.py - Flask RAG backend + frontend single-file
+**Avvio:**
+```bash
+python app.py
+```
+App disponibile su `http://localhost:5000`.
 
-1. Panoramica
-VaultRAG e' un'applicazione web Flask che implementa un sistema RAG ibrido (vettoriale + knowledge graph) sul vault Obsidian. Il backend e' Python, il frontend e' una single-page app HTML/JS servita inline da Flask.
+---
 
-Avvio:  python app.py  ->  http://localhost:5000
+## 1. Architettura
 
-2. Configurazione (CONFIG)
-Tutte le costanti sono definite in cima al file e modificabili direttamente.
+Il progetto è organizzato in moduli con dependency injection tramite `VaultRagContext` (dataclass condivisa, niente più variabili globali sparse):
 
-Costante
-Default
-Descrizione
-VAULT_PATH
-/home/fede/obsidian_notes/Notes
-Percorso root del vault Obsidian
-API_KEY
-sk-...
-API key per Qwen via DashScope (Alibaba)
-MODEL
-qwen-plus
-Modello LLM usato per la generazione
-N_RESULTS
-3
-Numero di chunk restituiti dal retriever al prompt LLM
-DB_PATH
-~/.vault_rag_db
-Directory ChromaDB su disco
-COLLECTION
-obsidian_vault
-Nome della collection ChromaDB
-EXTENSIONS
-*.md, *.txt, *.pdf...
-Tipi di file indicizzati dal vault
-CHAT_DIR
-_chat
-Cartella esclusa dall'indicizzazione (log chat)
-HISTORY_FILE
-~/.vault_rag_history.json
-File JSON della cronologia conversazioni
-STATE_FILE
-~/.vault_rag_state.json
-Mappa path->mtime per indicizzazione incrementale
-CHUNK_SIZE
-500
-Dimensione chunk in caratteri
-CHUNK_OVERLAP
-50
-Sovrapposizione tra chunk adiacenti in caratteri
-MAX_HISTORY
-10
-Numero massimo di scambi mantenuti in memoria
-DUP_THRESHOLD
-0.97
-Soglia cosine similarity per rilevamento duplicati
-OCR_LANGS
-ita+eng
-Lingue Tesseract per OCR su PDF scansionati
-GRAPH_FILE
-~/.vault_rag_graph.json
-File JSON di persistenza del knowledge graph
-GRAPH_CHUNK_SAMPLE
-3
-Chunk per file campionati per estrazione triplette LLM
-GRAPH_MAX_FILES
-200
-File massimi processati per build del knowledge graph
+| File | Ruolo |
+|---|---|
+| `app.py` | Entry point Flask: configurazione, routing principale, frontend |
+| `rag_core.py` | Logica core: estrazione testo, chunking, embedding, ChromaDB, knowledge graph, chiamate LLM |
+| `upload_handler.py` | Blueprint Flask per RAG temporaneo su file caricati al volo (nessuna persistenza) |
+| `model_switcher.py` | Cambio modello/LLM a runtime senza riavvio |
+| `frontend.html` | Interfaccia utente (single-page app) |
+| `test_rag_core.py` | Test unitari per `rag_core.py` |
 
-Modello di embedding: all-MiniLM-L6-v2 (SentenceTransformers) - 384 dimensioni. Per testi prevalentemente italiani considera multilingual-e5-large.
+---
 
-LLM endpoint: Alibaba DashScope - compatibile con API OpenAI.
-3. Funzioni Python
-3.1 Utility
-strip_emoji(text: str) -> str
-Rimuove tutti i caratteri Unicode non ASCII e non alfanumerici/punteggiatura dal testo. Usata per pulire l'output dell'LLM prima di restituirlo al frontend.
+## 2. Configurazione
 
-get_collection() -> chromadb.Collection
-Apre (o crea se non esiste) la collection ChromaDB persistente in DB_PATH. Chiamata ad ogni operazione sul DB vettoriale - non mantiene una connessione globale persistente.
+I parametri principali sono definiti come campi di default nella dataclass `VaultRagContext` (`rag_core.py`) e nelle costanti in cima ad `app.py`.
 
-vault_files() -> list[Path]
-Scansiona ricorsivamente VAULT_PATH per tutti i file con le estensioni in EXTENSIONS, escludendo qualsiasi file la cui path contenga _chat. Restituisce una lista di oggetti Path.
+### Percorsi e dati persistenti
 
-extract_text(file: Path) -> str
-Estrae il testo grezzo da un file in base all'estensione:
-- .md, .txt - lettura diretta con errors="ignore"
-- .pdf - PyMuPDF (fitz); se una pagina e' vuota tenta OCR con Tesseract a 200 DPI nelle lingue OCR_LANGS
-- .docx - python-docx, estrae tutti i paragrafi
-- .epub - ebooklib + BeautifulSoup, estrae testo da tutti i documenti HTML interni
-- .odt, .ods - odfpy (teletype.extractText)
-- .html, .htm - BeautifulSoup, testo grezzo senza tag
-Restituisce stringa vuota in caso di errore.
+| Costante | Default | Descrizione |
+|---|---|---|
+| `VAULT_PATH` | `/home/fede/obsidian_notes/Notes` | Percorso root del vault Obsidian |
+| `DB_PATH` | `~/.vault_rag_db` | Directory ChromaDB su disco |
+| `HISTORY_FILE` | `~/.vault_rag_history.json` | Cronologia conversazioni (JSON) |
+| `STATE_FILE` | `~/.vault_rag_state.json` | Mappa `path -> mtime` per indicizzazione incrementale |
+| `GRAPH_FILE` | `~/.vault_rag_graph.json` | Knowledge graph serializzato (formato `node_link` NetworkX) |
+| `CHAT_DIR` | `_chat` | Sottocartella del vault esclusa dall'indicizzazione (log conversazioni) |
+| `context_dir` | `_context` | Sottocartella con i file di contesto per materia |
 
-chunk_text(text: str) -> list[str]
-Divide il testo in chunk di CHUNK_SIZE caratteri con overlap di CHUNK_OVERLAP caratteri. Chunking a dimensione fissa (non semantico).
-chunk[0] = text[0 : 500]
-chunk[1] = text[450 : 950]
-chunk[2] = text[900 : 1400]
+> **Nota:** `VAULT_PATH` contiene un percorso assoluto specifico (`/home/fede/...`). Per uso su altre macchine, sostituirlo o renderlo configurabile via variabile d'ambiente.
 
-load_history() / save_history(history)
-Carica/salva la cronologia conversazione da HISTORY_FILE in formato JSON. save_history mantiene solo gli ultimi MAX_HISTORY*2 messaggi (domande + risposte).
+### LLM e API
 
-load_state() / save_state(state)
-Carica/salva il dizionario {path: mtime} usato per l'indicizzazione incrementale. Se il mtime di un file non e' cambiato, il file viene saltato durante il reindex.
+| Campo | Default | Descrizione |
+|---|---|---|
+| `api_key` | da `OPENROUTER_API_KEY` (env) | API key per il provider LLM |
+| `base_url` | `https://openrouter.ai/api/v1` | Endpoint compatibile OpenAI (OpenRouter) |
+| `model` | `qwen-plus` | Modello LLM di default |
+| `max_tokens` | `8192` | Limite token per risposta LLM |
 
-save_interaction(question, answer, sources)
-Salva ogni coppia domanda/risposta come file .md in VAULT_PATH/_chat/. Nome file: YYYY-MM-DD-<slug-domanda>.md. Include frontmatter YAML, sezioni Domanda, Risposta e Fonti con wikilink.
+Il modello può essere cambiato a runtime senza riavviare l'app, vedi [§4.5 Gestione Modello](#45-gestione-modello).
 
-call_llm(messages: list[dict]) -> str
-Invia una lista di messaggi al modello LLM configurato via OpenAI-compatible API e restituisce il testo della risposta passato per strip_emoji.
-3.2 Knowledge Graph
-load_graph() -> nx.DiGraph
-Carica il knowledge graph da GRAPH_FILE (formato node_link di NetworkX). Se il file non esiste o e' corrotto restituisce un grafo diretto vuoto.
+### Retrieval e indicizzazione
 
-save_graph(G: nx.DiGraph)
-Serializza il grafo in formato node_link JSON e lo scrive su GRAPH_FILE.
+| Campo | Default | Descrizione |
+|---|---|---|
+| `n_results` | `2` | Numero di chunk restituiti dal retriever al prompt LLM |
+| `chunk_size` | `500` | Dimensione di ogni chunk in caratteri |
+| `chunk_overlap` | `50` | Sovrapposizione tra chunk adiacenti in caratteri |
+| `extensions` | `*.md, *.txt, *.pdf, *.docx, *.epub, *.odt, *.ods, *.html, *.htm` | Tipi di file indicizzati dal vault |
+| `ocr_langs` | `ita+eng` | Lingue Tesseract per OCR su PDF scansionati |
+| `embed_model` | `all-MiniLM-L6-v2` | Modello SentenceTransformers per embedding testuali (384 dim) |
+| `code_embed_model` | `flax-sentence-embeddings/st-codesearch-distilroberta-base` | Modello di embedding specializzato per codice |
 
-extract_triples_llm(text_sample: str, filename: str) -> list[tuple]
-Invia un campione di testo all'LLM chiedendo di estrarre fino a 15 triplette nel formato SOGGETTO | RELAZIONE | OGGETTO. Ogni riga viene parsata, validata (3 parti, ognuna < 60 caratteri) e normalizzata in minuscolo. Restituisce lista di tuple (soggetto, relazione, oggetto).
+> Per testi prevalentemente in italiano si può valutare `multilingual-e5-large` come alternativa a `all-MiniLM-L6-v2`.
 
-build_graph_from_vault(solo_nuovi: bool = True)
-Costruisce o aggiorna il knowledge graph in un thread daemon separato. Processo:
-- Se solo_nuovi=True carica il grafo esistente, altrimenti parte da zero
-- Verifica che il vault sia indicizzato (ChromaDB non vuoto)
-- Per ogni file (max GRAPH_MAX_FILES): recupera chunk dal DB, campiona GRAPH_CHUNK_SAMPLE chunk, chiama extract_triples_llm
-- Per ogni tripletta: aggiunge nodi con weight e sources, aggiunge archi con relations e weight (incrementa se gia' esistente)
-- Salva il grafo aggiornato su disco
-I log sono scritti nella lista globale graph_log e consultabili via /api/graph/log.
+### Conversazione, duplicati, correzioni
 
-graph_expand_query(question: str, G: nx.DiGraph, top_n: int = 5) -> tuple
-Dato una domanda in linguaggio naturale:
-- Tokenizza la domanda in parole di almeno 3 caratteri
-- Per ogni nodo del grafo calcola overlap tra token del nodo e della query, pesato per il weight del nodo
-- Seleziona i top_n nodi seed con score piu' alto
-- Espande a 1-hop: aggiunge successori e predecessori di ogni seed
-- Raccoglie i file sorgente associati (deduplicati, max 6)
-- Costruisce testo relazionale con relazioni in/out dei seed (max 20 righe)
-Restituisce (entita_espanse, file_sorgente, testo_relazionale).
-3.3 Retrieval
-query_rag(question: str) -> tuple[list, list, str|None]
-RAG vettoriale puro. Embeds la domanda con all-MiniLM-L6-v2 e interroga ChromaDB per i N_RESULTS chunk piu' simili. Se e' attivo un contesto materia, filtra i risultati per le cartelle specificate nel file .md di contesto. Se il filtro non produce risultati, torna alla ricerca globale. Restituisce (documenti, metadati, errore).
+| Campo | Default | Descrizione |
+|---|---|---|
+| `max_history` | `20` | Numero massimo di scambi mantenuti in cronologia |
+| `dup_threshold` | `0.97` | Soglia di cosine similarity per rilevamento file duplicati |
+| `max_corrections` | `500` | Numero massimo di correzioni memorizzate |
+| `correction_boost` | `2.0` | Fattore di boost applicato ai contenuti corretti |
+| `error_context_n` | `5` | Numero di chunk di contesto usati per la verifica errori |
 
-query_hybrid(question: str) -> tuple[list, list, str|None, str]
-RAG ibrido = vettoriale + graph expansion. Esegue la stessa ricerca di query_rag, poi:
-- Chiama graph_expand_query per trovare file suggeriti dal grafo
-- Per ogni file suggerito non gia' presente nei risultati vettoriali, recupera il chunk piu' rilevante con sotto-query filtrata per file (max 2 file aggiuntivi)
-- Concatena risultati vettoriali con quelli graph-expanded
-Restituisce (documenti, metadati, errore, testo_relazionale).
+### Knowledge graph
 
+| Campo | Default | Descrizione |
+|---|---|---|
+| `graph_chunk_sample` | `3` | Chunk per file campionati per l'estrazione di triplette tramite LLM |
+| `graph_max_files` | `200` | Numero massimo di file processati durante la build del grafo |
+| `graph_max_workers` | `8` | Worker paralleli per la build del grafo |
 
-4. API Routes
-4.1 Chat e Query
-GET /
-Serve il frontend HTML/JS come single-page app tramite render_template_string(HTML).
+---
 
-POST /api/chat
+## 3. Funzioni principali (`rag_core.py`)
+
+### 3.1 Utility
+
+**`strip_emoji(text: str) -> str`**
+Rimuove emoji e caratteri Unicode non testuali dall'output dell'LLM prima di restituirlo al frontend.
+
+**`get_collection(ctx) -> chromadb.Collection`**
+Apre (o crea) la collection ChromaDB persistente in `DB_PATH`.
+
+**`vault_files(ctx) -> list[Path]`**
+Scansiona ricorsivamente `VAULT_PATH` per i file con estensioni in `extensions`, escludendo `_chat`.
+
+**`extract_text(file: Path, ocr_langs: str) -> str`**
+Estrae testo grezzo in base all'estensione:
+- `.md`, `.txt` → lettura diretta
+- `.pdf` → PyMuPDF (`fitz`); se una pagina è priva di testo, fallback a OCR Tesseract (200 DPI)
+- `.docx` → `python-docx`, tutti i paragrafi
+- `.epub` → `ebooklib` + BeautifulSoup su ogni documento HTML interno
+- `.odt`, `.ods` → `odfpy` (`teletype.extractText`)
+- `.html`, `.htm` → BeautifulSoup, testo senza tag
+
+Ritorna stringa vuota in caso di errore.
+
+**`chunk_text(text: str, chunk_size, chunk_overlap) -> list[str]`**
+Suddivisione a finestra fissa con overlap:
+```
+chunk[0] = text[0:500]
+chunk[1] = text[450:950]
+chunk[2] = text[900:1400]
+```
+(con i default `chunk_size=500`, `chunk_overlap=50`)
+
+**`load_history()` / `save_history(history)`**
+Carica/salva la cronologia da `HISTORY_FILE`. `save_history` mantiene solo gli ultimi `max_history * 2` messaggi.
+
+**`load_state()` / `save_state(state)`**
+Carica/salva la mappa `{path: mtime}` per l'indicizzazione incrementale: se il `mtime` non è cambiato, il file viene saltato al reindex.
+
+**`save_interaction(question, answer, sources)`**
+Salva ogni scambio come file `.md` in `VAULT_PATH/_chat/`, con nome `YYYY-MM-DD-<slug-domanda>.md`, frontmatter YAML e sezioni Domanda / Risposta / Fonti (con wikilink).
+
+**`call_llm(ctx, messages) -> str`**
+Invia i messaggi al modello LLM configurato (API compatibile OpenAI) e restituisce la risposta dopo `strip_emoji`.
+
+### 3.2 Knowledge Graph
+
+**`load_graph(ctx) -> nx.DiGraph`**
+Carica il grafo da `GRAPH_FILE` (formato `node_link`). Se mancante o corrotto, ritorna un grafo diretto vuoto.
+
+**`save_graph(ctx, G)`**
+Serializza il grafo in JSON `node_link` su `GRAPH_FILE`.
+
+**`extract_triples_llm(text_sample, filename) -> list[tuple]`**
+Chiede all'LLM di estrarre fino a 15 triplette `SOGGETTO | RELAZIONE | OGGETTO`, valida (3 parti, ognuna < 60 caratteri) e normalizza in minuscolo.
+
+**`build_graph_from_vault(ctx, solo_nuovi: bool = True)`**
+Costruisce/aggiorna il knowledge graph in un thread daemon:
+1. Se `solo_nuovi=True` carica il grafo esistente, altrimenti riparte da zero
+2. Verifica che il vault sia indicizzato (ChromaDB non vuoto)
+3. Per ogni file (max `graph_max_files`): recupera i chunk, campiona `graph_chunk_sample` chunk, chiama `extract_triples_llm`
+4. Aggiunge nodi (con `weight` e `sources`) e archi (con `relations` e `weight`, incrementati se già esistenti)
+5. Salva il grafo su disco
+
+Log disponibili via `/api/graph/log`.
+
+**`graph_expand_query(question, G, top_n=5) -> tuple`**
+1. Tokenizza la domanda (parole ≥ 3 caratteri)
+2. Per ogni nodo calcola l'overlap pesato con i token della query
+3. Seleziona i `top_n` nodi seed con score più alto
+4. Espande a 1-hop (predecessori + successori)
+5. Raccoglie i file sorgente associati (deduplicati, max 6)
+6. Costruisce un testo relazionale con le relazioni dei seed (max 20 righe)
+
+Ritorna `(entita_espanse, file_sorgente, testo_relazionale)`.
+
+### 3.3 Retrieval
+
+**`query_rag(ctx, question) -> tuple[list, list, str | None]`**
+RAG vettoriale puro: embedda la domanda con `embed_model`, interroga ChromaDB per i `n_results` chunk più simili. Se è attivo un contesto materia, filtra per le cartelle indicate; se il filtro non produce risultati, ricade sulla ricerca globale.
+
+**`query_hybrid(ctx, question) -> tuple[list, list, str | None, str]`**
+RAG ibrido = `query_rag` + graph expansion:
+1. Esegue `query_rag`
+2. Chiama `graph_expand_query` per individuare file suggeriti dal grafo
+3. Per ogni file suggerito non già presente nei risultati vettoriali, recupera il chunk più rilevante con sotto-query filtrata (max 2 file aggiuntivi)
+4. Concatena i risultati vettoriali con quelli graph-expanded
+
+---
+
+## 4. API Routes
+
+### 4.1 Chat e Query
+
+**`GET /`**
+Serve il frontend HTML/JS (single-page app).
+
+**`POST /api/chat`**
 Endpoint principale della chat RAG ibrida.
-Body: {"question": "testo"}
-Processo: chiama query_hybrid, costruisce il prompt iniettando contesto materia + relazioni grafo + chunk vettoriali, chiama call_llm, salva in history e in _chat/.
-Response: {"answer", "sources": [{"file","chunk","total"}], "graph_used": bool}
+- Body: `{"question": "testo"}`
+- Processo: `query_hybrid` → costruzione prompt (contesto materia + relazioni grafo + chunk vettoriali) → `call_llm` → salvataggio in history e in `_chat/`
+- Response: `{"answer", "sources": [{"file","chunk","total"}], "graph_used": bool}`
 
-POST /api/open
-Apre un file specifico e risponde a una domanda su di esso, bypassando la ricerca globale.
-Body: {"nome": "nome_file", "domanda": "testo"}
-Cerca il file per match parziale case-insensitive prima nel vault poi in _chat/, recupera tutti i chunk del file, calcola cosine similarity tra embedding della domanda e ogni chunk, passa i top N_RESULTS all'LLM.
+**`POST /api/open`**
+Risponde a una domanda su un file specifico, bypassando la ricerca globale.
+- Body: `{"nome": "nome_file", "domanda": "testo"}`
+- Cerca il file per match parziale case-insensitive (vault, poi `_chat/`), recupera tutti i chunk, calcola la similarità con la domanda e passa i top `n_results` all'LLM.
 
-POST /api/search
-Ricerca doppia: per nome file e per contenuto semantico.
-Body: {"termine": "testo"}
-- by_name: match parziale case-insensitive sul nome file, restituisce file e cartella
-- by_content: query vettoriale top-8, restituisce lista nomi file deduplicati
+**`POST /api/search`**
+Ricerca per nome file e per contenuto semantico.
+- Body: `{"termine": "testo"}`
+- `by_name`: match parziale case-insensitive sul nome file (file + cartella)
+- `by_content`: query vettoriale top-8, nomi file deduplicati
 
-POST /api/info
-Restituisce metadati di un file: nome, cartella relativa, tipo, dimensione KB, data modifica, numero di chunk indicizzati. Per i PDF aggiunge il numero di pagine.
+**`POST /api/info`**
+Metadati di un file: nome, cartella relativa, tipo, dimensione (KB), data modifica, numero di chunk indicizzati (per i PDF anche il numero di pagine).
 
-GET /api/duplicati
-Rileva file potenzialmente duplicati confrontando i vettori embedding del primo chunk (chunk 0) di ogni file. Se cosine similarity >= DUP_THRESHOLD (0.97) vengono segnalati come duplicati.
-Response: {"duplicati": [{"file1","file2","sim"}], "soglia": 0.97}
+**`GET /api/duplicati`**
+Confronta l'embedding del primo chunk di ogni file; se cosine similarity ≥ `dup_threshold` (default 0.97), segnala come duplicato.
+- Response: `{"duplicati": [{"file1","file2","sim"}], "soglia": 0.97}`
 
-GET /api/history?n=10
-Restituisce gli ultimi n scambi (coppie domanda/risposta) dalla cronologia.
+**`GET /api/history?n=10`**
+Ultimi `n` scambi domanda/risposta dalla cronologia.
 
-POST /api/reset
-Cancella HISTORY_FILE azzerando la cronologia conversazione.
+**`POST /api/reset`**
+Azzera `HISTORY_FILE`.
 
-POST /api/esporta
-Esporta tutta la conversazione corrente in un file .md in _chat/ con nome export-YYYY-MM-DD-HHMM.md. Include ogni scambio numerato con domanda e risposta in formato Markdown.
+**`POST /api/esporta`**
+Esporta la conversazione corrente in `_chat/export-YYYY-MM-DD-HHMM.md`, con ogni scambio numerato in Markdown.
 
-GET /api/esportazioni
-Lista tutti i file di export presenti in _chat/, ordinati per data decrescente.
+**`GET /api/esportazioni`**
+Lista i file di export in `_chat/`, ordinati per data decrescente.
 
-GET /api/lista-file
-Lista tutti i file nel vault (ordinati per nome) con conteggio totale.
+**`GET /api/lista-file`**
+Lista tutti i file del vault (ordinati per nome) con conteggio totale.
 
-GET /api/cartelle
-Lista tutte le cartelle uniche presenti nel vault (nome della cartella padre di ogni file).
+**`GET /api/cartelle`**
+Lista le cartelle uniche del vault (cartella padre di ogni file).
 
-GET /api/numero-file
-Statistiche di stato dell'indice:
-- vault: numero di file totali nel vault
-- chunk_db: numero di chunk totali in ChromaDB
-- non_indicizzati: file il cui mtime non corrisponde a quello in STATE_FILE
+**`GET /api/numero-file`**
+Statistiche dell'indice:
+- `vault`: numero totale di file nel vault
+- `chunk_db`: numero totale di chunk in ChromaDB
+- `non_indicizzati`: file il cui `mtime` non corrisponde a `STATE_FILE`
 
-GET /api/stats
-Statistiche generali: chunk totali, file totali, numero scambi in cronologia, modello LLM attivo, materia attiva.
-4.2 Indicizzazione
-POST /api/reindex
-Avvia il reindex del vault in un thread daemon separato.
-Body: {"solo_nuovi": true|false}
-- solo_nuovi: true (default) - indicizza solo i file non ancora presenti in ChromaDB (controlla l'id {file}::chunk0). File gia' indicizzati vengono saltati.
-- solo_nuovi: false - reindex completo: elimina l'intera collection ChromaDB e la ricrea da zero.
+**`GET /api/stats`**
+Statistiche generali: chunk totali, file totali, numero di scambi in cronologia, modello LLM attivo, materia attiva.
 
-Processo per ogni file: estrae testo con extract_text, divide in chunk con chunk_text, calcola embedding in batch (batch_size=64), inserisce in ChromaDB con id {path}::chunkN e metadati {file, path, type, chunk, total}, aggiorna STATE_FILE con il nuovo mtime.
-Response immediata: {"ok": true} - il processo gira in background.
+### 4.2 Indicizzazione
 
-GET /api/reindex-log
+**`POST /api/reindex`**
+Avvia il reindex del vault in un thread daemon.
+- Body: `{"solo_nuovi": true|false}`
+  - `true` (default): indicizza solo i file non ancora presenti in ChromaDB (controllo su id `{file}::chunk0`)
+  - `false`: reindex completo — elimina e ricrea l'intera collection ChromaDB
+
+Per ogni file: `extract_text` → `chunk_text` → embedding in batch (`batch_size=64`) → insert in ChromaDB con id `{path}::chunkN` e metadati `{file, path, type, chunk, total}` → aggiornamento `STATE_FILE`.
+
+Response immediata: `{"ok": true}` (processo in background).
+
+**`GET /api/reindex-log`**
 Polling dello stato del reindex.
-Response: {"log": ["OK: file.pdf (12 chunk)", ...], "running": bool}
-4.3 Knowledge Graph
-POST /api/graph/build
+Response: `{"log": ["OK: file.pdf (12 chunk)", ...], "running": bool}`
+
+### 4.3 Knowledge Graph
+
+**`POST /api/graph/build`**
 Avvia la build del knowledge graph in background.
-Body: {"solo_nuovi": true|false}
-- solo_nuovi: true - aggiunge solo file non gia' processati
-- solo_nuovi: false - ricostruisce il grafo da zero
+- Body: `{"solo_nuovi": true|false}` — `true`: aggiunge solo i file non ancora processati; `false`: ricostruisce da zero
 
-GET /api/graph/log
-Polling dello stato della build del grafo.
-Response: {"log": [...], "running": bool}
+**`GET /api/graph/log`**
+Polling dello stato della build.
+Response: `{"log": [...], "running": bool}`
 
-GET /api/graph/stats
-Statistiche del knowledge graph: nodes, edges, components (componenti debolmente connesse), top_nodes (top 10 nodi per weight con file sorgente).
+**`GET /api/graph/stats`**
+Statistiche del grafo: `nodes`, `edges`, `components` (componenti debolmente connesse), `top_nodes` (top 10 per `weight` con file sorgente).
 
-POST /api/graph/search
-Ricerca nodi nel grafo per sottostringa. Restituisce per ogni nodo trovato: nome, peso, file sorgente, archi in uscita (successori con relazione), archi in entrata (predecessori). Max 15 risultati per peso decrescente.
+**`POST /api/graph/search`**
+Ricerca nodi per sottostringa. Per ogni nodo trovato: nome, peso, file sorgente, archi uscenti (successori + relazione), archi entranti (predecessori). Max 15 risultati, ordinati per peso decrescente.
 
-GET /api/graph/data?limit=150
-Restituisce i dati del grafo per la visualizzazione D3.js. Prende i limit nodi con peso piu' alto e tutti gli archi tra di essi.
-Response: {"nodes": [{"id","weight","sources"}], "links": [{"source","target","relation","weight"}]}
+**`GET /api/graph/data?limit=150`**
+Dati del grafo per visualizzazione D3.js: i `limit` nodi con peso più alto e tutti gli archi tra essi.
+Response: `{"nodes": [{"id","weight","sources"}], "links": [{"source","target","relation","weight"}]}`
 
-POST /api/graph/delete
-Elimina GRAPH_FILE dal disco, cancellando il knowledge graph.
-4.4 Gestione Materia / Contesto
-GET /api/materia
-Restituisce lo stato del contesto materia corrente: nome materia attiva, system prompt corrente, lunghezza del testo di contesto.
+**`POST /api/graph/delete`**
+Elimina `GRAPH_FILE` dal disco.
 
-POST /api/materia - action: "attiva"
-Body: {"action": "attiva", "nome": "reti"}
-Legge il file _context/reti.md dal vault e lo carica in current_materia_context. Sostituisce il system prompt con uno specializzato sulla materia. Da questo momento tutte le query vengono filtrate per le cartelle elencate nel file di contesto.
+### 4.4 Gestione Materia / Contesto
 
-POST /api/materia - action: "reset"
-Ripristina il system prompt al default e azzera current_materia e current_materia_context. Le query tornano a cercare in tutto il vault.
+**`GET /api/materia`**
+Stato del contesto materia corrente: nome materia attiva, system prompt corrente, lunghezza del testo di contesto.
 
-POST /api/materia - action: "genera"
-Body: {"action": "genera", "nome": "nome_materia"}
-Genera automaticamente un file di contesto: interroga ChromaDB con il nome materia come query, recupera i file piu' rilevanti, campiona il contenuto e chiede all'LLM di generare un file .md strutturato. Scrive il file in _context/nome_materia.md.
+**`POST /api/materia` — `action: "attiva"`**
+- Body: `{"action": "attiva", "nome": "reti"}`
+- Carica `_context/reti.md` dal vault, sostituisce il system prompt con uno specializzato. Da questo momento le query sono filtrate per le cartelle elencate nel file di contesto.
 
-POST /api/materia - action: "aggiorna"
-Aggiorna un file di contesto esistente: interroga ChromaDB per trovare file recenti pertinenti e li appende al file esistente in una sezione "## File aggiornati automaticamente".
+**`POST /api/materia` — `action: "reset"`**
+Ripristina il system prompt al default e azzera materia/contesto attivi. Le query tornano a cercare in tutto il vault.
 
-POST /api/materia - action: "lista"
-Elenca tutti i file .md presenti in _context/ (senza estensione).
+**`POST /api/materia` — `action: "genera"`**
+- Body: `{"action": "genera", "nome": "nome_materia"}`
+- Interroga ChromaDB col nome materia, recupera i file più rilevanti, campiona il contenuto e chiede all'LLM di generare un file `.md` strutturato in `_context/nome_materia.md`.
 
+**`POST /api/materia` — `action: "aggiorna"`**
+Aggiorna un file di contesto esistente: cerca file recenti pertinenti e li appende in una sezione `## File aggiornati automaticamente`.
 
-5. Struttura dei Dati Persistenti
+**`POST /api/materia` — `action: "lista"`**
+Elenca tutti i file `.md` in `_context/` (senza estensione).
 
-File
-Formato
-Contenuto
-~/.vault_rag_db/
-ChromaDB
-Vettori embedding + chunk + metadati
-~/.vault_rag_history.json
-JSON array
-Lista messaggi {role, content}
-~/.vault_rag_state.json
-JSON object
-{'/path/file': 'mtime_string'}
-~/.vault_rag_graph.json
-JSON node_link
-Grafo NetworkX serializzato
-VAULT_PATH/_context/*.md
-Markdown
-File di contesto per materia
-VAULT_PATH/_chat/*.md
-Markdown
-Log conversazioni e export
+### 4.5 Gestione Modello
 
-6. Variabili Globali di Stato
-Queste variabili sono globali al processo Flask - non persistono al riavvio (eccetto i dati su disco). In un deployment multi-worker andrebbero spostate su Redis o simili.
+**`GET /api/model`**
+Configurazione corrente: modello attivo, `base_url`, se l'API key è impostata.
 
-Variabile
-Descrizione
-current_system_prompt
-System prompt LLM corrente (modificato da /api/materia). Default: assistente generico sul vault.
-current_materia
-Nome della materia attiva (stringa vuota se nessuna).
-current_materia_context
-Contenuto del file .md di contesto attivo, usato per filtrare il retrieval.
-reindex_log
-Lista di stringhe con il log dell'ultimo reindex. Condivisa col frontend via polling su /api/reindex-log.
-reindex_running
-Flag booleano mutex per il thread di reindex. Impedisce avvii concorrenti.
-graph_log
-Lista di stringhe con il log dell'ultima build del grafo.
-graph_running
-Flag booleano mutex per il thread del knowledge graph.
+**`GET /api/model/list`**
+Lista dei modelli predefiniti disponibili (vedi `model_switcher.AVAILABLE_MODELS`).
 
-7. Pipeline RAG Ibrida - Schema
+**`POST /api/model/change`**
+- Body: `{"model_name": "...", "api_key": "...", "base_url": "..."}` (`api_key` e `base_url` opzionali)
+- `model_name` può essere un preset (es. `"gemini-free"`) o un nome diretto di modello (es. `"google/gemma-4-31b-it:free"`)
+- Se cambia `base_url` o `api_key`, il client LLM viene ricreato
 
-Flusso completo di una query su /api/chat:
+**`POST /api/model/test`**
+Esegue una chiamata di test al modello corrente e restituisce latenza e risposta.
 
-- 1. La domanda viene embeddata con all-MiniLM-L6-v2 (384 dim)
-- 2. ChromaDB esegue ricerca per cosine similarity e restituisce N_RESULTS chunk
-- 3. Se current_materia e' attivo, i risultati vengono filtrati per cartelle specificate nel file .md di contesto
-- 4. Parallelamente, graph_expand_query tokenizza la domanda e trova nodi nel grafo con overlap semantico
-- 5. I file suggeriti dal grafo (non gia' nei risultati vettoriali) vengono aggiunti con sotto-query vettoriali filtrate (max 2)
-- 6. Il prompt finale contiene: system prompt + contesto materia + relazioni grafo + chunk vettoriali
-- 7. L'LLM (qwen-plus) genera la risposta
-- 8. La coppia domanda/risposta viene salvata in history e come file .md in _chat/
+### 4.6 Upload temporaneo (`upload_handler.py`)
 
-8. Manutenzione e Aggiornamento
-Aggiungere nuovi file al vault
-- Aggiungi il file nella cartella appropriata del vault
-- Avvia /api/reindex con solo_nuovi: true per indicizzare solo i nuovi file
-- Aggiorna il file _context/materia.md corrispondente con il nuovo [[wikilink]] e note descrittive
-- Se il file introduce nuovi argomenti, aggiungili a ## Concetti chiave
+**`POST /api/upload`**
+RAG temporaneo su un file caricato al volo (nessuna persistenza, nessun accesso a ChromaDB/vault/history).
+- Multipart form: `file` (uno dei formati supportati, max 50 MB) + `question` (testo)
+- Processo: validazione → salvataggio in file temporaneo → `extract_text` → `chunk_text` → embedding di domanda e chunk → ranking per cosine similarity → top-3 chunk → `call_llm` → cleanup del file temporaneo (garantito anche in caso di errore)
+- Response: `{"answer", "file", "chunks", "top_chunks", "best_score", "timing": {"embedding","llm","total"}}`
 
-Ricostruire l'indice da zero
-POST /api/reindex con solo_nuovi: false. Elimina la collection ChromaDB e la ricrea indicizzando tutti i file.
+---
 
-Aggiornare il knowledge graph
-POST /api/graph/build con solo_nuovi: true dopo ogni reindex per aggiornare le relazioni semantiche.
+## 5. Struttura dei dati persistenti
 
-Cambiare materia attiva
-- Dalla UI: tab Materia -> inserisci nome -> clicca Attiva
-- Via API: POST /api/materia con {"action": "attiva", "nome": "nome_materia"}
-- Per tornare alla ricerca globale: POST /api/materia con {"action": "reset"}
+| File / Directory | Formato | Contenuto |
+|---|---|---|
+| `~/.vault_rag_db/` | ChromaDB | Vettori embedding + chunk + metadati |
+| `~/.vault_rag_history.json` | JSON array | Lista messaggi `{role, content}` |
+| `~/.vault_rag_state.json` | JSON object | `{"path/file": "mtime_string"}` |
+| `~/.vault_rag_graph.json` | JSON `node_link` | Knowledge graph serializzato (NetworkX) |
+| `VAULT_PATH/_context/*.md` | Markdown | File di contesto per materia |
+| `VAULT_PATH/_chat/*.md` | Markdown | Log conversazioni ed export |
 
-VaultRAG - Manuale Tecnico
+---
+
+## 6. Stato condiviso (`VaultRagContext`)
+
+Tutto lo stato runtime è centralizzato nella dataclass `VaultRagContext` (`rag_core.py`), iniettata nei vari moduli (`app.py`, `upload_handler.py`, `model_switcher.py`) tramite dependency injection — non sono più presenti variabili globali sparse nel modulo.
+
+Principali sotto-componenti:
+
+| Campo | Descrizione |
+|---|---|
+| `state` (`AppState`) | System prompt corrente, materia attiva, contesto materia, log e flag di reindex/graph build |
+| `_llm_client`, `_embedder`, `_code_embedder`, `_chroma` | Singleton lazy (client OpenAI, modelli embedding, client ChromaDB) con relativi lock thread-safe |
+
+> In un deployment multi-worker, lo stato runtime (`AppState`) andrebbe spostato su uno store condiviso (es. Redis), perché non persiste tra i processi.
+
+---
+
+## 7. Pipeline RAG ibrida — schema
+
+Flusso completo di una query su `/api/chat`:
+
+1. La domanda viene embeddata con `embed_model` (default `all-MiniLM-L6-v2`, 384 dim)
+2. ChromaDB esegue la ricerca per cosine similarity e restituisce `n_results` chunk
+3. Se è attiva una materia, i risultati vengono filtrati per le cartelle del relativo file di contesto
+4. In parallelo, `graph_expand_query` tokenizza la domanda e trova nodi del grafo con overlap semantico
+5. I file suggeriti dal grafo (non già nei risultati vettoriali) vengono aggiunti con sotto-query filtrate (max 2)
+6. Il prompt finale contiene: system prompt + contesto materia + relazioni grafo + chunk vettoriali
+7. L'LLM configurato (default `qwen-plus`, cambiabile a runtime) genera la risposta
+8. La coppia domanda/risposta viene salvata in history e come file `.md` in `_chat/`
+
+---
+
+## 8. Manutenzione
+
+**Aggiungere nuovi file al vault**
+1. Copia il file nella cartella appropriata del vault
+2. `POST /api/reindex` con `{"solo_nuovi": true}` per indicizzare solo i nuovi file
+3. Aggiorna il file `_context/materia.md` corrispondente con il nuovo `[[wikilink]]` e note descrittive
+4. Se il file introduce nuovi argomenti, aggiungili a `## Concetti chiave`
+
+**Ricostruire l'indice da zero**
+`POST /api/reindex` con `{"solo_nuovi": false}` — elimina e ricrea la collection ChromaDB indicizzando tutti i file.
+
+**Aggiornare il knowledge graph**
+`POST /api/graph/build` con `{"solo_nuovi": true}` dopo ogni reindex, per aggiornare le relazioni semantiche.
+
+**Cambiare materia attiva**
+- UI: tab *Materia* → inserisci nome → *Attiva*
+- API: `POST /api/materia` con `{"action": "attiva", "nome": "nome_materia"}`
+- Per tornare alla ricerca globale: `POST /api/materia` con `{"action": "reset"}`
+
+**Cambiare modello LLM**
+- `GET /api/model/list` per vedere i preset disponibili
+- `POST /api/model/change` con `{"model_name": "gemini-free"}` (o un nome di modello diretto)
