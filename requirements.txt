@@ -1,0 +1,32 @@
+# ── Web framework ───────────────────────────────────
+flask
+
+# ── Configurazione ──────────────────────────────────
+python-dotenv
+
+# ── LLM client (OpenRouter / API compatibile OpenAI) ─
+openai
+
+# ── Embeddings ──────────────────────────────────────
+sentence-transformers
+
+# ── Vector DB ───────────────────────────────────────
+chromadb
+
+# ── Knowledge graph ─────────────────────────────────
+networkx
+
+# ── Numerics ─────────────────────────────────────────
+numpy
+
+# ── Estrazione testo da documenti ───────────────────
+PyMuPDF           # fitz: parsing PDF + estrazione immagini per OCR
+python-docx       # .docx
+EbookLib          # .epub
+odfpy             # .odt / .ods
+beautifulsoup4    # pulizia HTML/epub/odf
+pytesseract       # OCR su PDF scansionati
+Pillow            # gestione immagini per OCR
+
+# ── Testing ──────────────────────────────────────────
+pytest
